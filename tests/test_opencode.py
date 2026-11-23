@@ -76,3 +76,12 @@ def test_tool_history_is_preserved_with_disabled_tools():
     ], [])
     assert messages[0].role == "user"
     assert "call_1" in messages[0].content
+
+
+def test_external_schema_refs_are_not_resolved():
+    unsafe = ToolDefinition.model_validate({"type": "function", "function": {
+        "name": "read_file",
+        "parameters": {"$ref": "http://127.0.0.1:80/untrusted.json"}
+    }})
+    payload = '<tool_call>{"name":"read_file","arguments":{}}</tool_call>'
+    assert not parse_tool_calls(payload, [unsafe])
