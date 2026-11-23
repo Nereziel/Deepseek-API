@@ -1,0 +1,93 @@
+# OpenCode integration (experimental tool calling)
+
+This fork adds OpenAI `tools` and `tool_choice` support directly to the existing
+FastAPI `POST /v1/chat/completions` endpoint. **No separate proxy is required.**
+The DeepSeek consumer web interface does not provide native function calling,
+so tool calls are **prompt-emulated and best-effort**. The bridge validates function
+names and JSON arguments against the advertised schema and returns OpenAI
+`tool_calls`; it does not run tools itself. OpenCode executes tools locally.
+
+## Install on Windows Server
+
+From a PowerShell session in this repo:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
+.\.venv\Scripts\python.exe -m deepseek.auth
+.\.venv\Scripts\python.exe app.py
+```
+
+Existing virtual environments work too; use the same Python path with
+`-m pip install -r requirements.txt`. Run the login interactively once.
+Test `http://127.0.0.1:8000/healthz` and `http://127.0.0.1:8000/v1/models`.
+
+## OpenCode 2.x configuration
+
+In your project `opencode.jsonc` (or global OpenCode config):
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "deepseek-local/deepseek-chat",
+  "providers": {
+    "deepseek-local": {
+      "name": "DeepSeek Web (local)",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:8000/v1"
+      },
+      "models": {
+        "deepseek-chat": {
+          "name": "DeepSeek Instant (web)",
+          "capabilities": {"tools": true, "input": ["text"], "output": ["text"]}
+        },
+        "deepseek-expert": {
+          "name": "DeepSeek Expert (web)",
+          "capabilities": {"tools": true, "input": ["text"], "output": ["text"]}
+        }
+      }
+    }
+  }
+}
+```
+
+Use `/models` inside OpenCode to pick `deepseek-local/deepseek-chat`.
+This config targets the current OpenCode 2.x schema. Older OpenCode versions
+use `provider` / `npm` / `options.baseURL` instead.
+
+**Important:** `127.0.0.1` works only if OpenCode and the bridge run on the
+same host. If OpenCode runs on your PC and the bridge on a Windows Server,
+use a private VPN address and protect the HTTP endpoint with authentication.
+The base project has no inbound API authentication; do not expose port 8000
+to the public Internet, particularly with a reusable DeepSeek login session.
+
+## How tool calls work
+
+1. OpenCode sends OpenAI `tools` and recent `messages`.
+2. The bridge prompts the DeepSeek web model to emit `<tool_call>` JSON.
+3. The response is validated against the allowed tool names and JSON schemas.
+4. The bridge returns OpenAI `tool_calls` and `finish_reason: "tool_calls"`.
+5. OpenCode runs the tool and returns `role: "tool"` results on the next turn.
+
+Tool-enabled `stream: true` requests are **buffered** until the model has
+finished: the returned SSE stream follows the OpenAI format, but it is not live
+token-by-token streaming. Text-only requests retain normal streaming.
+
+The model may return regular text instead of a valid tool call. Malformed,
+unrecognized or schema-invalid tool calls are returned as text, never executed.
+Tool output is untrusted input. Tool execution and permissions belong to OpenCode.
+For coding agents, avoid granting automatic permission for destructive commands
+until you've verified the model's behavior on your workload.
+
+The web API does not support native `/v1/responses`, guaranteed tool_choice
+compliance, native image input or accurate token usage. Do not assume these
+features from the OpenAI-compatible endpoint.
+
+## Offline tests
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest -q
+```
