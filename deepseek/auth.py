@@ -27,6 +27,8 @@ from typing import Dict, Optional
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
+from .proxy import proxy_url
+
 ROOT = Path(__file__).resolve().parent.parent
 # Load .env before reading settings below, whichever entry point imported us.
 load_dotenv(ROOT / ".env")
@@ -165,6 +167,9 @@ def _launch_browser(playwright, profile_dir: Path, headless: bool):
     Only auto retains the original Chrome -> bundled Chromium fallback.
     """
     kwargs = {"headless": headless, "args": LAUNCH_ARGS}
+    proxy = proxy_url()
+    if proxy:
+        kwargs["proxy"] = {"server": proxy}
     if PLAYWRIGHT_CHANNEL == "chromium":
         return playwright.chromium.launch_persistent_context(str(profile_dir), **kwargs)
     if PLAYWRIGHT_CHANNEL != "auto":
