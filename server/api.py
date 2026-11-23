@@ -45,6 +45,8 @@ from .openai_format import (
     stream_chunks,
     stream_error,
 )
+from .stream_tools import buffered_tool_stream
+from .tools import active_tools, parse_tool_calls, prepare_tool_messages
 from .ratelimit import RateLimiter, install_rate_limit
 from .schemas import ChatCompletionRequest
 
@@ -119,7 +121,12 @@ async def chat_completions(req: ChatCompletionRequest):
     # A thread's model is fixed when it's created, so on resume we ignore `model`
     # (the OpenAI SDK always sends one) and let the existing thread's model stand.
     model_type = None if req.conversation_id else resolve_model_type(req.model)
-    prompt = messages_to_prompt(req.messages)
+    try:
+        enabled_tools = active_tools(req.tools, req.tool_choice)
+    except ValueError as e:
+        return _error(str(e), status=400, err_type="invalid_request_error")
+    prepared_messages = prepare_tool_messages(req.messages, enabled_tools, req.tool_choice)
+    prompt = messages_to_prompt(prepared_messages)
 
     try:
         # Off the event loop: get_client() uses Playwright's sync API, which
@@ -129,6 +136,37 @@ async def chat_completions(req: ChatCompletionRequest):
         return _error(str(e), status=503, err_type="login_required")
     except Exception as e:  # session/login failure
         return _error(f"Failed to initialise DeepSeek session: {e}")
+
+    if enabled_tools:
+        # The web API cannot natively stream tools. Buffer the upstream response
+        # before classifying it so that we never expose partial tool syntax.
+        try:
+            reply = await run_in_threadpool(
+                client.chat, prompt, req.conversation_id,
+                model_type, req.thinking, req.search,
+            )
+        except LoginRequired as e:
+            return _error(str(e), status=503, err_type="login_required")
+        except Exception as e:
+            return _error(f"DeepSeek request failed: {e}")
+
+        completion = completion_response(
+            req.model, reply.text, prompt, reply.conversation_id, reply.reasoning
+        )
+        calls = parse_tool_calls(reply.text, enabled_tools, req.parallel_tool_calls)
+        if calls:
+            completion["choices"][0]["message"] = {
+                "role": "assistant", "content": None, "tool_calls": calls
+            }
+            if reply.reasoning:
+                completion["choices"][0]["message"]["reasoning_content"] = reply.reasoning
+            completion["choices"][0]["finish_reason"] = "tool_calls"
+        if req.stream:
+            return StreamingResponse(
+                buffered_tool_stream(completion), media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+            )
+        return completion
 
     if req.stream:
         # Open the thread before responding, so failures here (bad session,
