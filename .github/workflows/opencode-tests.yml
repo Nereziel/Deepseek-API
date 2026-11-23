@@ -19,6 +19,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install offline test dependencies
-        run: python -m pip install "pydantic>=2.7" "jsonschema>=4.19" "python-dotenv>=1.0" "pytest>=8.0"
+        run: python -m pip install -r requirements-dev.txt
       - name: Run contract tests
-        run: python -m pytest tests/test_opencode.py -q
+        run: python -m pytest tests/test_opencode.py tests/test_browser_channel.py -q
