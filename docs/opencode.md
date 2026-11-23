@@ -23,6 +23,18 @@ Existing virtual environments work too; use the same Python path with
 `-m pip install -r requirements.txt`. Run the login interactively once.
 Test `http://127.0.0.1:8000/healthz` and `http://127.0.0.1:8000/v1/models`.
 
+### Use installed Microsoft Edge instead of bundled Chromium
+
+Set `PLAYWRIGHT_CHANNEL=msedge` in the repository's `.env` file.
+Edge must already be installed. No separate Playwright Chromium installation
+is required when Edge is selected. Both manual login and headless session
+refresh use Edge; launch failure is reported instead of silently selecting
+another browser. By default Edge uses the isolated `session/profile-msedge`
+profile, not your regular browser profile. Run `python -m deepseek.auth`
+again after switching to replace the cached session, then restart the server.
+Unset the setting or set it to `auto` to preserve Chrome-first behavior,
+or use `chromium` to select the bundled browser explicitly.
+
 ## OpenCode 2.x configuration
 
 In your project `opencode.jsonc` (or global OpenCode config):
