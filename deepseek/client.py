@@ -31,6 +31,7 @@ import httpx
 
 from .auth import Session, get_session
 from .pow import DeepSeekPow
+from .proxy import proxy_url
 
 BASE = "https://chat.deepseek.com"
 COMPLETION_PATH = "/api/v0/chat/completion"
@@ -117,11 +118,14 @@ class DeepSeekClient:
         # The wasmtime Store behind the PoW solver is not reentrant; serialise
         # access so concurrent server requests don't corrupt it.
         self._pow_lock = threading.Lock()
+        proxy = proxy_url()
+        transport_options = {"proxy": proxy, "trust_env": False} if proxy else {}
         self._http = httpx.Client(
             base_url=BASE,
             headers=self._base_headers(),
             cookies=self.session.cookies,
             timeout=httpx.Timeout(120.0, read=300.0),
+            **transport_options,
         )
 
     def _base_headers(self) -> dict:
