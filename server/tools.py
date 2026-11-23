@@ -89,6 +89,18 @@ def prepare_tool_messages(messages, tools, choice=None):
     return [ChatMessage(role="system", content=system), *history]
 
 
+def _has_remote_refs(value):
+    """Refuse external JSON Schema references (avoid network fetch/SSRF)."""
+    if isinstance(value, dict):
+        ref = value.get("$ref")
+        if ref is not None and (not isinstance(ref, str) or not ref.startswith("#")):
+            return True
+        return any(_has_remote_refs(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_remote_refs(v) for v in value)
+    return False
+
+
 def parse_tool_calls(content, tools, parallel=True):
     """Parse only complete standalone blocks with known names and valid arguments."""
     if not tools or not content:
@@ -109,6 +121,8 @@ def parse_tool_calls(content, tools, parallel=True):
             if not isinstance(name, str) or name not in available or not isinstance(args, dict):
                 return []
             schema = available[name].parameters or {"type": "object"}
+            if _has_remote_refs(schema):
+                return []
             Draft202012Validator.check_schema(schema)
             Draft202012Validator(schema).validate(args)
         except (TypeError, ValueError, schema_errors.SchemaError, schema_errors.ValidationError):
