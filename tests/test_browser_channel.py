@@ -46,3 +46,61 @@ def test_bundled_chromium_explicit(monkeypatch):
     pw.chromium.launch_persistent_context.assert_called_once_with(
         "profile", headless=True, args=auth.LAUNCH_ARGS
     )
+
+
+@pytest.fixture(autouse=True)
+def clear_proxy(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_PROXY", raising=False)
+
+
+@pytest.mark.parametrize("headless", [False, True])
+@pytest.mark.parametrize("channel", ["chrome", "msedge", "chromium", "auto"])
+def test_browser_proxy(monkeypatch, headless, channel):
+    monkeypatch.setenv("DEEPSEEK_PROXY", "socks5://127.0.0.1:9090")
+    monkeypatch.setattr(auth, "PLAYWRIGHT_CHANNEL", channel)
+    pw = Mock()
+    auth._launch_browser(pw, Path("profile"), headless)
+    kwargs = pw.chromium.launch_persistent_context.call_args.kwargs
+    assert kwargs["proxy"] == {"server": "socks5://127.0.0.1:9090"}
+    assert kwargs["headless"] is headless
+
+
+def test_proxy_preserved_in_auto_fallback(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_PROXY", "socks5://127.0.0.1:9090")
+    monkeypatch.setattr(auth, "PLAYWRIGHT_CHANNEL", "auto")
+    pw = Mock()
+    pw.chromium.launch_persistent_context.side_effect = [RuntimeError("Chrome unavailable"), Mock()]
+    auth._launch_browser(pw, Path("profile"), False)
+    for call in pw.chromium.launch_persistent_context.call_args_list:
+        assert call.kwargs["proxy"] == {"server": "socks5://127.0.0.1:9090"}
+
+
+@pytest.mark.parametrize("value", ["http://localhost:9090", "socks5://localhost", "socks5://user:password@localhost:9090", "socks5://localhost:0", "socks5://localhost:99999", "socks5://localhost:9090/path"])
+def test_invalid_proxy(monkeypatch, value):
+    from deepseek.proxy import proxy_url
+
+    monkeypatch.setenv("DEEPSEEK_PROXY", value)
+    with pytest.raises(ValueError, match="DEEPSEEK_PROXY"):
+        proxy_url()
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_httpx_proxy(monkeypatch, configured):
+    from deepseek import client
+
+    proxy = "socks5://127.0.0.1:9090"
+    if configured:
+        monkeypatch.setenv("DEEPSEEK_PROXY", proxy)
+    session = auth.Session("test-token", {}, "test-agent", 0)
+    monkeypatch.setattr(client, "DeepSeekPow", Mock())
+    http = Mock()
+    monkeypatch.setattr(client.httpx, "Client", http)
+    instance = client.DeepSeekClient(session)
+    kwargs = http.call_args.kwargs
+    if configured:
+        assert kwargs["proxy"] == proxy
+        assert kwargs["trust_env"] is False
+    else:
+        assert "proxy" not in kwargs
+        assert "trust_env" not in kwargs
+    instance.close()
