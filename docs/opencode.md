@@ -36,7 +36,8 @@ In your project `opencode.jsonc` (or global OpenCode config):
       "name": "DeepSeek Web (local)",
       "package": "@opencode/ai/providers/openai-compatible",
       "settings": {
-        "baseURL": "http://127.0.0.1:8000/v1"
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "unused"
       },
       "models": {
         "deepseek-chat": {
@@ -53,7 +54,7 @@ In your project `opencode.jsonc` (or global OpenCode config):
 }
 ```
 
-Use `/models` inside OpenCode to pick `deepseek-local/deepseek-chat`.
+The `apiKey` above is a dummy required by some clients; the local server does not verify it. It is NOT an access control.\n\nUse `/models` inside OpenCode to pick `deepseek-local/deepseek-chat`.
 This config targets the current OpenCode 2.x schema. Older OpenCode versions
 use `provider` / `npm` / `options.baseURL` instead.
 
