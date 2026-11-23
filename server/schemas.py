@@ -1,33 +1,53 @@
-"""Pydantic models for the OpenAI-compatible request/response shapes we support."""
-
+"""Pydantic models for OpenAI-compatible chat and tool calling."""
 from __future__ import annotations
-
-from typing import List, Optional, Union
-
-from pydantic import BaseModel
-
+from typing import List, Literal, Optional, Union
+from pydantic import BaseModel, Field
 from .config import DEFAULT_MODEL
+
+
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str = "{}"
+
+
+class AssistantToolCall(BaseModel):
+    id: str
+    type: Literal["function"] = "function"
+    function: FunctionCall
 
 
 class ChatMessage(BaseModel):
     role: str
-    # content is a plain string, or a list of parts (OpenAI vision-style). We only
-    # read text parts; non-text parts are ignored.
     content: Union[str, List[dict], None] = None
+    name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    tool_calls: Optional[List[AssistantToolCall]] = None
+
+
+class ToolFunction(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: dict = Field(default_factory=lambda: {"type": "object"})
+    strict: Optional[bool] = None
+
+
+class ToolDefinition(BaseModel):
+    type: Literal["function"] = "function"
+    function: ToolFunction
 
 
 class ChatCompletionRequest(BaseModel):
     model: str = DEFAULT_MODEL
     messages: List[ChatMessage]
     stream: bool = False
-    # Pass a conversation_id from a previous response to resume that thread.
     conversation_id: Optional[str] = None
-    # Tools to enable for this request, independent of the model. OpenAI clients
-    # pass these via extra_body: `thinking` (DeepThink), `search` (web).
     thinking: bool = False
     search: bool = False
-    # Accepted for compatibility but not all are forwarded to DeepSeek.
+    tools: Optional[List[ToolDefinition]] = None
+    tool_choice: Optional[Union[str, dict]] = None
+    parallel_tool_calls: bool = True
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
     user: Optional[str] = None
