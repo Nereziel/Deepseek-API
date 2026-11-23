@@ -9,6 +9,7 @@ import re
 import uuid
 
 from jsonschema import Draft202012Validator, exceptions as schema_errors
+from referencing.exceptions import Unresolvable
 from .schemas import ChatMessage
 
 TOOL_BLOCK = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
@@ -125,7 +126,7 @@ def parse_tool_calls(content, tools, parallel=True):
                 return []
             Draft202012Validator.check_schema(schema)
             Draft202012Validator(schema).validate(args)
-        except (TypeError, ValueError, schema_errors.SchemaError, schema_errors.ValidationError):
+        except (TypeError, ValueError, schema_errors.SchemaError, schema_errors.ValidationError, Unresolvable):
             return []
         calls.append({
             "id": "call_" + uuid.uuid4().hex[:24],
