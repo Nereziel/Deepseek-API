@@ -104,3 +104,26 @@ features from the OpenAI-compatible endpoint.
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m pytest -q
 ```
+
+
+## Optional SOCKS5 proxy
+
+For a local proxy such as AdGuard VPN in SOCKS5 mode, install the updated
+requirements and set the following in the project-root `.env`:
+
+```ini
+DEEPSEEK_PROXY=socks5://127.0.0.1:9090
+HOST=127.0.0.1
+PORT=8001
+PLAYWRIGHT_CHANNEL=chrome
+```
+
+The configured proxy is used for HTTPX requests and both interactive browser
+login and headless session refresh. Only SOCKS5 URLs without credentials are
+supported. With an explicit proxy, HTTPX ignores environment proxy settings
+and does not retry over a direct connection. Unset DEEPSEEK_PROXY to retain
+the original behavior. Restart the server after changing the settings.
+
+Keep the proxy bound to loopback. When OpenCode runs on the same machine, its
+provider base URL is `http://127.0.0.1:8001/v1`; incoming API requests do not
+use the SOCKS5 proxy. Test the proxy separately before signing in manually.
