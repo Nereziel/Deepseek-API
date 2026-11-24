@@ -21,6 +21,7 @@ RATE_LIMIT_PER_MINUTE); /healthz is exempt.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -49,6 +50,8 @@ from .stream_tools import buffered_tool_stream
 from .tools import active_tools, parse_tool_calls, prepare_tool_messages
 from .ratelimit import RateLimiter, install_rate_limit
 from .schemas import ChatCompletionRequest
+
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="DeepSeek OpenAI-compatible API", version="0.1.0")
 install_rate_limit(
@@ -127,6 +130,9 @@ async def chat_completions(req: ChatCompletionRequest):
         return _error(str(e), status=400, err_type="invalid_request_error")
     prepared_messages = prepare_tool_messages(req.messages, enabled_tools, req.tool_choice)
     prompt = messages_to_prompt(prepared_messages)
+    logger.info("DeepSeek request: model=%s stream=%s thinking=%s messages=%d tools=%d prompt_chars=%d",
+                req.model, req.stream, req.thinking_enabled, len(req.messages),
+                len(enabled_tools), len(prompt))
 
     try:
         # Off the event loop: get_client() uses Playwright's sync API, which
@@ -143,13 +149,16 @@ async def chat_completions(req: ChatCompletionRequest):
         try:
             reply = await run_in_threadpool(
                 client.chat, prompt, req.conversation_id,
-                model_type, req.thinking, req.search,
+                model_type, req.thinking_enabled, req.search,
             )
         except LoginRequired as e:
             return _error(str(e), status=503, err_type="login_required")
         except Exception as e:
             return _error(f"DeepSeek request failed: {e}")
 
+        if not reply.text.strip():
+            logger.warning("DeepSeek empty completion: reasoning_chars=%d", len(reply.reasoning))
+            return _error("DeepSeek returned no final content", status=502, err_type="upstream_error")
         completion = completion_response(
             req.model, reply.text, prompt, reply.conversation_id, reply.reasoning
         )
@@ -161,6 +170,8 @@ async def chat_completions(req: ChatCompletionRequest):
             if reply.reasoning:
                 completion["choices"][0]["message"]["reasoning_content"] = reply.reasoning
             completion["choices"][0]["finish_reason"] = "tool_calls"
+        logger.info("DeepSeek completion: text_chars=%d reasoning_chars=%d tool_calls=%d",
+                    len(reply.text), len(reply.reasoning), len(calls))
         if req.stream:
             return StreamingResponse(
                 buffered_tool_stream(completion), media_type="text/event-stream",
@@ -174,7 +185,7 @@ async def chat_completions(req: ChatCompletionRequest):
         try:
             stream = await run_in_threadpool(
                 client.stream, prompt, req.conversation_id,
-                model_type, req.thinking, req.search,
+                model_type, req.thinking_enabled, req.search,
             )
         except LoginRequired as e:
             return _error(str(e), status=503, err_type="login_required")
@@ -188,19 +199,25 @@ async def chat_completions(req: ChatCompletionRequest):
             try:
                 yield from stream_chunks(req.model, stream)
             except Exception as e:
-                yield from stream_error(f"DeepSeek request failed: {e}")
+                logger.warning("DeepSeek stream failed: %s", type(e).__name__)
+                yield from stream_error(f"DeepSeek request failed: {e}", err_type="upstream_error")
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
     try:
         reply = await run_in_threadpool(
             client.chat, prompt, req.conversation_id,
-            model_type, req.thinking, req.search,
+            model_type, req.thinking_enabled, req.search,
         )
     except LoginRequired as e:
         return _error(str(e), status=503, err_type="login_required")
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
 
+    if not reply.text.strip():
+        logger.warning("DeepSeek empty completion: reasoning_chars=%d", len(reply.reasoning))
+        return _error("DeepSeek returned no final content", status=502, err_type="upstream_error")
+    logger.info("DeepSeek completion: text_chars=%d reasoning_chars=%d tool_calls=0",
+                len(reply.text), len(reply.reasoning))
     return completion_response(req.model, reply.text, prompt, reply.conversation_id,
                                reply.reasoning)

@@ -286,6 +286,11 @@ class _Stream:
             "POST", COMPLETION_PATH, json=body, headers=headers
         ) as resp:
             resp.raise_for_status()
+            if "application/json" in resp.headers.get("content-type", "").lower():
+                resp.read()
+                data = resp.json()
+                code = data.get("code") if isinstance(data, dict) else None
+                raise RuntimeError(f"DeepSeek returned JSON instead of SSE (code={code if isinstance(code, int) else 'unknown'})")
             yield from _parse_sse(resp.iter_lines(), meta)
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
@@ -313,16 +318,34 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[str, str]]:
     we look in a few plausible spots defensively.
     """
     frag_types: list = []
+    frag_texts: list[str] = []
     active_path: Optional[str] = None
 
-    def add_fragments(frags) -> Iterator[tuple[str, str]]:
-        for frag in frags or []:
+    def add_fragments(frags, snapshot=False) -> Iterator[tuple[str, str]]:
+        for index, frag in enumerate(frags or []):
             if not isinstance(frag, dict):
                 continue
             kind = frag.get("type") or RESPONSE
+            content = frag.get("content")
+            content = content if isinstance(content, str) else ""
+            if snapshot and index < len(frag_types):
+                # A later full snapshot can repeat text already emitted as deltas.
+                previous = frag_texts[index]
+                if frag_types[index] != kind:
+                    raise RuntimeError("DeepSeek changed an existing fragment type")
+                if previous.startswith(content):
+                    continue
+                if not content.startswith(previous):
+                    raise RuntimeError("DeepSeek replaced already streamed text")
+                delta = content[len(previous):]
+                frag_texts[index] = content
+                if delta:
+                    yield kind, delta
+                continue
             frag_types.append(kind)
-            if isinstance(frag.get("content"), str) and frag["content"]:
-                yield kind, frag["content"]
+            frag_texts.append(content)
+            if content:
+                yield kind, content
 
     def type_at(path: str) -> str:
         # "response/fragments/<index>/content" -> that fragment's type. Before
@@ -340,6 +363,12 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[str, str]]:
         elif path.endswith("fragments") and isinstance(v, list):
             yield from add_fragments(v)
         elif path.endswith("/content") and isinstance(v, str) and op in (None, "APPEND"):
+            try:
+                index = int(path.split("/")[-2])
+                frag_texts[index] += v
+            except (IndexError, ValueError):
+                if frag_texts:
+                    frag_texts[-1] += v
             yield type_at(path), v
         elif path.endswith("message_id") and isinstance(v, int) and meta is not None:
             meta["message_id"] = v
@@ -355,13 +384,17 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[str, str]]:
         except json.JSONDecodeError:
             continue
 
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("error") or (isinstance(obj.get("code"), int) and obj["code"] != 0):
+            raise RuntimeError("DeepSeek reported an error inside its completion stream")
         v = obj.get("v")
 
         # Snapshot frame: full response object.
         if isinstance(v, dict) and "response" in v:
             if meta is not None:
                 _capture_message_id(meta, v)
-            yield from add_fragments(v["response"].get("fragments"))
+            yield from add_fragments(v["response"].get("fragments"), snapshot=True)
             active_path = "response/fragments/-1/content"
             continue
 

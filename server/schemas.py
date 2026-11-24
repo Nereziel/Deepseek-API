@@ -36,12 +36,17 @@ class ToolDefinition(BaseModel):
     function: ToolFunction
 
 
+class ChatTemplateKwargs(BaseModel):
+    enable_thinking: Optional[bool] = None
+
+
 class ChatCompletionRequest(BaseModel):
     model: str = DEFAULT_MODEL
     messages: List[ChatMessage]
     stream: bool = False
     conversation_id: Optional[str] = None
-    thinking: bool = False
+    thinking: Optional[bool] = None
+    chat_template_kwargs: Optional[ChatTemplateKwargs] = None
     search: bool = False
     tools: Optional[List[ToolDefinition]] = None
     tool_choice: Optional[Union[str, dict]] = None
@@ -51,3 +56,12 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     max_completion_tokens: Optional[int] = None
     user: Optional[str] = None
+
+    @property
+    def thinking_enabled(self) -> bool:
+        """Explicit native setting takes precedence over compatible clients."""
+        if self.thinking is not None:
+            return self.thinking
+        if self.chat_template_kwargs is not None:
+            return self.chat_template_kwargs.enable_thinking is True
+        return False

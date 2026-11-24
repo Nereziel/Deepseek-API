@@ -85,3 +85,82 @@ def test_external_schema_refs_are_not_resolved():
     }})
     payload = '<tool_call>{"name":"read_file","arguments":{}}</tool_call>'
     assert not parse_tool_calls(payload, [unsafe])
+
+
+def test_thinking_compatibility():
+    base = {"messages": [{"role": "user", "content": "hello"}]}
+    assert not ChatCompletionRequest.model_validate(base).thinking_enabled
+    assert ChatCompletionRequest.model_validate({
+        **base, "chat_template_kwargs": {"enable_thinking": True}
+    }).thinking_enabled
+    assert not ChatCompletionRequest.model_validate({
+        **base, "thinking": False, "chat_template_kwargs": {"enable_thinking": True}
+    }).thinking_enabled
+
+
+def test_closed_tools_keep_call_identity_and_request_prose():
+    messages = prepare_tool_messages([
+        ChatMessage.model_validate({"role": "assistant", "tool_calls": [{
+            "id": "call_test", "function": {"name": "read_file", "arguments": '{"path":"a"}'}
+        }]}),
+        ChatMessage(role="tool", tool_call_id="call_test", content="result")
+    ], [], "none")
+    assert "do not emit tool calls" in messages[0].content
+    assert "call_test" in messages[1].content
+    assert "read_file (call_test)" in messages[2].content
+
+
+def test_replayed_snapshot_emits_only_new_text():
+    from deepseek.client import _parse_sse, THINK, RESPONSE
+    frames = [
+        {"v": {"response": {"fragments": [{"type": THINK, "content": "Think"}]}}},
+        {"p": "response/fragments/-1/content", "o": "APPEND", "v": " once"},
+        {"v": {"response": {"fragments": [
+            {"type": THINK, "content": "Think once"},
+            {"type": RESPONSE, "content": "Hello"}
+        ]}}},
+        {"v": "!"},
+    ]
+    assert list(_parse_sse("data: " + json.dumps(f) for f in frames)) == [
+        (THINK, "Think"), (THINK, " once"), (RESPONSE, "Hello"), (RESPONSE, "!")
+    ]
+
+
+def test_upstream_error_is_not_a_successful_stream():
+    from deepseek.client import _parse_sse
+    with pytest.raises(RuntimeError, match="reported an error"):
+        list(_parse_sse(['data: {"code": 40003}']))
+
+
+def test_reasoning_only_stream_has_no_success_finish():
+    from deepseek.client import THINK
+    from server.openai_format import stream_chunks
+
+    class Stream:
+        def events(self):
+            yield THINK, "thinking"
+
+    frames = stream_chunks("deepseek-chat", Stream())
+    assert "assistant" in next(frames)
+    assert "reasoning_content" in next(frames)
+    with pytest.raises(RuntimeError, match="no final content"):
+        next(frames)
+
+
+@pytest.mark.parametrize("with_tools", [False, True])
+def test_empty_completion_reports_502(monkeypatch, with_tools):
+    from fastapi.testclient import TestClient
+    from deepseek.client import Reply
+    from server import api
+
+    class Client:
+        def chat(self, *args):
+            return Reply(text="", reasoning="thinking", conversation_id="s:2")
+
+    monkeypatch.setattr(api, "get_client", lambda: Client())
+    body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]}
+    if with_tools:
+        body["tools"] = [tool().model_dump()]
+    response = TestClient(api.app).post("/v1/chat/completions", json=body)
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "upstream_error"

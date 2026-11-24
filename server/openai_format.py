@@ -8,6 +8,7 @@ text output back into OpenAI response/stream objects.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from typing import Iterable, List
@@ -119,13 +120,22 @@ def stream_chunks(model: str, stream) -> Iterable[str]:
 
     # First frame announces the assistant role.
     yield frame({"role": "assistant", "content": ""})
+    text_chars = reasoning_chars = 0
+    has_content = False
     for kind, d in stream.events():
         if not d:
             continue
         if kind == RESPONSE:
+            text_chars += len(d)
+            has_content = has_content or bool(d.strip())
             yield frame({"content": d})
         elif kind == THINK:
+            reasoning_chars += len(d)
             yield frame({"reasoning_content": d})
+    if not has_content:
+        raise RuntimeError(f"DeepSeek returned no final content (reasoning_chars={reasoning_chars})")
+    logging.getLogger("uvicorn.error").info(
+        "DeepSeek stream: text_chars=%d reasoning_chars=%d", text_chars, reasoning_chars)
     conversation_id = getattr(stream, "conversation_id", None)
     yield frame({}, finish="stop", extra={"conversation_id": conversation_id})
     yield "data: [DONE]\n\n"
