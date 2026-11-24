@@ -102,6 +102,33 @@ def _auth_failed(r: httpx.Response) -> bool:
         return False
 
 
+def _completion_json_error(payload) -> str:
+    """Expose bounded status fields, not the raw response or chat contents."""
+    root = payload if isinstance(payload, dict) else {}
+    data = root.get("data")
+    data = data if isinstance(data, dict) else {}
+    biz = data.get("biz_data", root.get("biz_data"))
+    fields = []
+    for label, value in (
+        ("code", root.get("code")),
+        ("msg", root.get("msg")),
+        ("biz_code", data.get("biz_code", root.get("biz_code"))),
+        ("biz_msg", data.get("biz_msg", root.get("biz_msg"))),
+    ):
+        if isinstance(value, (int, str)):
+            # Single line, bounded, escaped control characters.
+            fields.append(f"{label}={str(value)[:240]!r}")
+    if isinstance(biz, dict):
+        fields.append("biz_data_keys=" + repr(sorted(str(k)[:80] for k in biz)[:20]))
+        for key in ("code", "status", "error_code", "error_message", "message"):
+            value = biz.get(key)
+            if isinstance(value, (int, str)):
+                fields.append(f"biz_data.{key}={str(value)[:240]!r}")
+    else:
+        fields.append("biz_data_type=" + type(biz).__name__)
+    return "DeepSeek returned JSON instead of SSE (" + ", ".join(fields) + ")"
+
+
 class DeepSeekClient:
     def __init__(
         self,
@@ -288,9 +315,11 @@ class _Stream:
             resp.raise_for_status()
             if "application/json" in resp.headers.get("content-type", "").lower():
                 resp.read()
-                data = resp.json()
-                code = data.get("code") if isinstance(data, dict) else None
-                raise RuntimeError(f"DeepSeek returned JSON instead of SSE (code={code if isinstance(code, int) else 'unknown'})")
+                try:
+                    data = resp.json()
+                except ValueError:
+                    raise RuntimeError("DeepSeek returned invalid JSON instead of SSE") from None
+                raise RuntimeError(_completion_json_error(data))
             yield from _parse_sse(resp.iter_lines(), meta)
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
