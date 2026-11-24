@@ -164,3 +164,19 @@ def test_empty_completion_reports_502(monkeypatch, with_tools):
     response = TestClient(api.app).post("/v1/chat/completions", json=body)
     assert response.status_code == 502
     assert response.json()["error"]["type"] == "upstream_error"
+
+
+def test_non_sse_business_status_diagnostic():
+    from deepseek.client import _completion_json_error
+    msg = _completion_json_error({
+        "code": 0, "msg": "ok", "data": {
+            "biz_code": 123, "biz_msg": "example status",
+            "biz_data": {"status": "failed", "token": "SECRET", "prompt": "PRIVATE"}
+        }
+    })
+    assert "biz_code='123'" in msg
+    assert "biz_msg='example status'" in msg
+    assert "biz_data.status='failed'" in msg
+    assert "SECRET" not in msg
+    assert "PRIVATE" not in msg
+    assert "biz_data_type=NoneType" in _completion_json_error({"code": 0})
