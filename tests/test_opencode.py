@@ -180,3 +180,74 @@ def test_non_sse_business_status_diagnostic():
     assert "SECRET" not in msg
     assert "PRIVATE" not in msg
     assert "biz_data_type=NoneType" in _completion_json_error({"code": 0})
+
+
+@pytest.mark.parametrize("until", [1795489999, "2026-11-25T00:00:00Z", None])
+def test_muted_business_status(until):
+    from deepseek.client import AccountMuted, _biz, _raise_if_muted
+    payload = {"code": 0, "data": {"biz_code": 5, "biz_msg": "user is muted",
+                "biz_data": {"is_muted": True, "mute_until": until}}}
+    for check in (_biz, _raise_if_muted):
+        with pytest.raises(AccountMuted) as exc:
+            check(payload)
+        assert exc.value.mute_until == until
+    _raise_if_muted({"code": 0, "data": {"biz_code": 5, "biz_msg": "other"}})
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("with_tools", [False, True])
+def test_muted_completion_returns_403(monkeypatch, stream, with_tools):
+    from fastapi.testclient import TestClient
+    from deepseek.client import AccountMuted
+    from server import api
+
+    class Stream:
+        def events(self):
+            raise AccountMuted(1795489999)
+            yield  # generator, as in the real client
+
+    class Client:
+        def chat(self, *args):
+            raise AccountMuted(1795489999)
+
+        def stream(self, *args):
+            return Stream()
+
+    monkeypatch.setattr(api, "get_client", lambda: Client())
+    body = {"model": "deepseek-chat", "stream": stream,
+            "messages": [{"role": "user", "content": "hi"}]}
+    if with_tools:
+        body["tools"] = [tool().model_dump()]
+    response = TestClient(api.app).post("/v1/chat/completions", json=body)
+    assert response.status_code == 403
+    error = response.json()["error"]
+    assert error["code"] == "account_muted"
+    assert error["mute_until"] == 1795489999
+    assert error["retryable"] is False
+
+
+def test_stream_muted_after_first_delta(monkeypatch):
+    from fastapi.testclient import TestClient
+    from deepseek.client import AccountMuted, RESPONSE
+    from server import api
+
+    class Stream:
+        def events(self):
+            yield RESPONSE, "hello"
+            raise AccountMuted(None)
+
+    class Client:
+        def stream(self, *args):
+            return Stream()
+
+    monkeypatch.setattr(api, "get_client", lambda: Client())
+    response = TestClient(api.app).post("/v1/chat/completions", json={
+        "model": "deepseek-chat", "stream": True,
+        "messages": [{"role": "user", "content": "hi"}]
+    })
+    assert response.status_code == 200
+    frames = [json.loads(line[6:]) for line in response.text.splitlines()
+              if line.startswith("data: ") and line != "data: [DONE]"]
+    assert frames[-1]["error"]["code"] == "account_muted"
+    assert frames[-1]["error"]["retryable"] is False
+    assert "finish_reason" not in frames[-1]

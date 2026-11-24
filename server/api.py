@@ -30,7 +30,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from deepseek.auth import LoginRequired
-from deepseek.client import DeepSeekClient
+from deepseek.client import AccountMuted, DeepSeekClient
 
 from .config import (
     MODEL_MAP,
@@ -92,6 +92,17 @@ def _error(message: str, status: int = 500, err_type: str = "server_error"):
     )
 
 
+def _muted_details(exc: AccountMuted) -> dict:
+    logger.warning("DeepSeek account muted: mute_until=%r", exc.mute_until)
+    return {"message": str(exc), "type": "permission_error",
+            "code": "account_muted", "mute_until": exc.mute_until,
+            "retryable": False}
+
+
+def _muted_error(exc: AccountMuted):
+    return JSONResponse(status_code=403, content={"error": _muted_details(exc)})
+
+
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
@@ -138,6 +149,8 @@ async def chat_completions(req: ChatCompletionRequest):
         # Off the event loop: get_client() uses Playwright's sync API, which
         # errors if run inside the asyncio loop.
         client = await run_in_threadpool(get_client)
+    except AccountMuted as e:
+        return _muted_error(e)
     except LoginRequired as e:
         return _error(str(e), status=503, err_type="login_required")
     except Exception as e:  # session/login failure
@@ -151,6 +164,8 @@ async def chat_completions(req: ChatCompletionRequest):
                 client.chat, prompt, req.conversation_id,
                 model_type, req.thinking_enabled, req.search,
             )
+        except AccountMuted as e:
+            return _muted_error(e)
         except LoginRequired as e:
             return _error(str(e), status=503, err_type="login_required")
         except Exception as e:
@@ -187,20 +202,40 @@ async def chat_completions(req: ChatCompletionRequest):
                 client.stream, prompt, req.conversation_id,
                 model_type, req.thinking_enabled, req.search,
             )
+        except AccountMuted as e:
+            return _muted_error(e)
         except LoginRequired as e:
             return _error(str(e), status=503, err_type="login_required")
         except Exception as e:
             return _error(f"DeepSeek request failed: {e}")
 
+        # Prime the stream before sending headers: a JSON restriction from
+        # upstream must be an HTTP 403, not a successful HTTP 200 SSE.
+        frames = iter(stream_chunks(req.model, stream))
+        try:
+            first = await run_in_threadpool(next, frames, None)
+        except AccountMuted as e:
+            return _muted_error(e)
+        except LoginRequired as e:
+            return _error(str(e), status=503, err_type="login_required")
+        except Exception as e:
+            logger.warning("DeepSeek stream failed before first frame: %s", type(e).__name__)
+            return _error(f"DeepSeek request failed: {e}", status=502, err_type="upstream_error")
+        if first is None:
+            return _error("DeepSeek returned no stream", status=502, err_type="upstream_error")
+
         def gen():
-            # Headers are already sent by now, so report a mid-stream failure
-            # as an error frame (the OpenAI SDK raises on it) rather than
-            # silently dropping the connection.
             try:
-                yield from stream_chunks(req.model, stream)
+                yield first
+                yield from frames
+            except AccountMuted as e:
+                yield from stream_error(str(e), err_type="permission_error",
+                                        details=_muted_details(e))
             except Exception as e:
                 logger.warning("DeepSeek stream failed: %s", type(e).__name__)
                 yield from stream_error(f"DeepSeek request failed: {e}", err_type="upstream_error")
+            finally:
+                frames.close()
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -209,6 +244,8 @@ async def chat_completions(req: ChatCompletionRequest):
             client.chat, prompt, req.conversation_id,
             model_type, req.thinking_enabled, req.search,
         )
+    except AccountMuted as e:
+        return _muted_error(e)
     except LoginRequired as e:
         return _error(str(e), status=503, err_type="login_required")
     except Exception as e:

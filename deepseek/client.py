@@ -82,8 +82,40 @@ class Reply:
         return self.text
 
 
+class AccountMuted(RuntimeError):
+    """DeepSeek explicitly restricted this account; do not retry automatically."""
+
+    def __init__(self, mute_until=None):
+        # Preserve the upstream value without assuming timestamp units.
+        self.mute_until = (
+            mute_until[:128] if isinstance(mute_until, str)
+            else mute_until if type(mute_until) is int
+            else None
+        )
+        super().__init__(
+            "DeepSeek account is muted; check the account on chat.deepseek.com "
+            f"(mute_until={self.mute_until!r})."
+        )
+
+
+def _raise_if_muted(payload) -> None:
+    root = payload if isinstance(payload, dict) else {}
+    data = root.get("data")
+    data = data if isinstance(data, dict) else {}
+    biz = data.get("biz_data", root.get("biz_data"))
+    biz = biz if isinstance(biz, dict) else {}
+    code = data.get("biz_code", root.get("biz_code"))
+    message = data.get("biz_msg", root.get("biz_msg"))
+    if biz.get("is_muted") is True or (
+        str(code) == "5" and isinstance(message, str)
+        and message.strip().lower() == "user is muted"
+    ):
+        raise AccountMuted(biz.get("mute_until"))
+
+
 def _biz(data: dict) -> dict:
     """Unwrap DeepSeek's `data.biz_data` envelope, raising on API-level errors."""
+    _raise_if_muted(data)
     if data.get("code") != 0:
         raise RuntimeError(f"DeepSeek API error: {data.get('msg') or data}")
     biz = data.get("data", {}).get("biz_data")
@@ -319,6 +351,7 @@ class _Stream:
                     data = resp.json()
                 except ValueError:
                     raise RuntimeError("DeepSeek returned invalid JSON instead of SSE") from None
+                _raise_if_muted(data)
                 raise RuntimeError(_completion_json_error(data))
             yield from _parse_sse(resp.iter_lines(), meta)
         if meta.get("message_id") is not None:
@@ -415,6 +448,7 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[str, str]]:
 
         if not isinstance(obj, dict):
             continue
+        _raise_if_muted(obj)
         if obj.get("error") or (isinstance(obj.get("code"), int) and obj["code"] != 0):
             raise RuntimeError("DeepSeek reported an error inside its completion stream")
         v = obj.get("v")
