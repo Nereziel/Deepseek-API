@@ -65,7 +65,7 @@ def prepare_tool_messages(messages, tools, choice=None):
                     args = json.loads(call.function.arguments)
                 except (ValueError, TypeError):
                     args = {}
-                blocks.append("[Previous tool call ID: " + call.id + "]\n".replace("\n", "\\n") + "<tool_call>" + json.dumps({
+                blocks.append("[Previous tool call ID: " + call.id + "]\n" + "<tool_call>" + json.dumps({
                     "name": call.function.name, "arguments": args
                 }, ensure_ascii=False) + "</tool_call>")
             content = "\n".join(part for part in [_text(message.content), *blocks] if part)
