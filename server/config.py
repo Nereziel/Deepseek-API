@@ -16,6 +16,11 @@ def _env_flag(name: str, default: str) -> bool:
 # Requests per minute allowed per client IP (override with RATE_LIMIT_PER_MINUTE).
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "30"))
 
+# Local test budget in characters of the flattened prompt, not a provider limit.
+MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "80000"))
+if MAX_PROMPT_CHARS < 1:
+    raise ValueError("MAX_PROMPT_CHARS must be positive")
+
 # Key the rate limiter on the X-Forwarded-For header instead of the peer IP.
 # Only turn this on behind a reverse proxy that sets the header; otherwise any
 # caller can send a fake one and dodge the limit.

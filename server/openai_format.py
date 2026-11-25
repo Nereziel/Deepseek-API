@@ -8,6 +8,7 @@ text output back into OpenAI response/stream objects.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from typing import Iterable, List
@@ -117,22 +118,36 @@ def stream_chunks(model: str, stream) -> Iterable[str]:
             obj.update(extra)
         return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
-    # First frame announces the assistant role.
-    yield frame({"role": "assistant", "content": ""})
+    # Wait for the first actual upstream text before announcing the role.
+    # This lets the HTTP endpoint report upstream rejection before SSE starts.
+    text_chars = reasoning_chars = 0
+    has_content = False
+    started = False
     for kind, d in stream.events():
-        if not d:
+        if not d or kind not in (RESPONSE, THINK):
             continue
+        if not started:
+            started = True
+            yield frame({"role": "assistant", "content": ""})
         if kind == RESPONSE:
+            text_chars += len(d)
+            has_content = has_content or bool(d.strip())
             yield frame({"content": d})
         elif kind == THINK:
+            reasoning_chars += len(d)
             yield frame({"reasoning_content": d})
+    if not has_content:
+        raise RuntimeError(f"DeepSeek returned no final content (reasoning_chars={reasoning_chars})")
+    logging.getLogger("uvicorn.error").info(
+        "DeepSeek stream: text_chars=%d reasoning_chars=%d", text_chars, reasoning_chars)
     conversation_id = getattr(stream, "conversation_id", None)
     yield frame({}, finish="stop", extra={"conversation_id": conversation_id})
     yield "data: [DONE]\n\n"
 
 
-def stream_error(message: str, err_type: str = "server_error") -> Iterable[str]:
+def stream_error(message: str, err_type: str = "server_error",
+                 details: dict | None = None) -> Iterable[str]:
     """SSE lines reporting a failure after the stream has started."""
-    err = {"error": {"message": message, "type": err_type}}
+    err = {"error": {"message": message, "type": err_type, **(details or {})}}
     yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"

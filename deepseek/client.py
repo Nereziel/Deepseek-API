@@ -31,6 +31,7 @@ import httpx
 
 from .auth import Session, get_session
 from .pow import DeepSeekPow
+from .proxy import proxy_url
 
 BASE = "https://chat.deepseek.com"
 COMPLETION_PATH = "/api/v0/chat/completion"
@@ -81,8 +82,40 @@ class Reply:
         return self.text
 
 
+class AccountMuted(RuntimeError):
+    """DeepSeek explicitly restricted this account; do not retry automatically."""
+
+    def __init__(self, mute_until=None):
+        # Preserve the upstream value without assuming timestamp units.
+        self.mute_until = (
+            mute_until[:128] if isinstance(mute_until, str)
+            else mute_until if type(mute_until) is int
+            else None
+        )
+        super().__init__(
+            "DeepSeek account is muted; check the account on chat.deepseek.com "
+            f"(mute_until={self.mute_until!r})."
+        )
+
+
+def _raise_if_muted(payload) -> None:
+    root = payload if isinstance(payload, dict) else {}
+    data = root.get("data")
+    data = data if isinstance(data, dict) else {}
+    biz = data.get("biz_data", root.get("biz_data"))
+    biz = biz if isinstance(biz, dict) else {}
+    code = data.get("biz_code", root.get("biz_code"))
+    message = data.get("biz_msg", root.get("biz_msg"))
+    if biz.get("is_muted") is True or (
+        str(code) == "5" and isinstance(message, str)
+        and message.strip().lower() == "user is muted"
+    ):
+        raise AccountMuted(biz.get("mute_until"))
+
+
 def _biz(data: dict) -> dict:
     """Unwrap DeepSeek's `data.biz_data` envelope, raising on API-level errors."""
+    _raise_if_muted(data)
     if data.get("code") != 0:
         raise RuntimeError(f"DeepSeek API error: {data.get('msg') or data}")
     biz = data.get("data", {}).get("biz_data")
@@ -101,6 +134,33 @@ def _auth_failed(r: httpx.Response) -> bool:
         return False
 
 
+def _completion_json_error(payload) -> str:
+    """Expose bounded status fields, not the raw response or chat contents."""
+    root = payload if isinstance(payload, dict) else {}
+    data = root.get("data")
+    data = data if isinstance(data, dict) else {}
+    biz = data.get("biz_data", root.get("biz_data"))
+    fields = []
+    for label, value in (
+        ("code", root.get("code")),
+        ("msg", root.get("msg")),
+        ("biz_code", data.get("biz_code", root.get("biz_code"))),
+        ("biz_msg", data.get("biz_msg", root.get("biz_msg"))),
+    ):
+        if isinstance(value, (int, str)):
+            # Single line, bounded, escaped control characters.
+            fields.append(f"{label}={str(value)[:240]!r}")
+    if isinstance(biz, dict):
+        fields.append("biz_data_keys=" + repr(sorted(str(k)[:80] for k in biz)[:20]))
+        for key in ("code", "status", "error_code", "error_message", "message"):
+            value = biz.get(key)
+            if isinstance(value, (int, str)):
+                fields.append(f"biz_data.{key}={str(value)[:240]!r}")
+    else:
+        fields.append("biz_data_type=" + type(biz).__name__)
+    return "DeepSeek returned JSON instead of SSE (" + ", ".join(fields) + ")"
+
+
 class DeepSeekClient:
     def __init__(
         self,
@@ -117,11 +177,14 @@ class DeepSeekClient:
         # The wasmtime Store behind the PoW solver is not reentrant; serialise
         # access so concurrent server requests don't corrupt it.
         self._pow_lock = threading.Lock()
+        proxy = proxy_url()
+        transport_options = {"proxy": proxy, "trust_env": False} if proxy else {}
         self._http = httpx.Client(
             base_url=BASE,
             headers=self._base_headers(),
             cookies=self.session.cookies,
             timeout=httpx.Timeout(120.0, read=300.0),
+            **transport_options,
         )
 
     def _base_headers(self) -> dict:
@@ -160,6 +223,8 @@ class DeepSeekClient:
         survives token expiry without a restart."""
         token = self.session.token
         r = self._http.post(path, json=body)
+        if r.status_code in (403, 429):
+            r.raise_for_status()
         if _auth_failed(r):
             self.refresh_session(stale_token=token)
             r = self._http.post(path, json=body)
@@ -282,6 +347,14 @@ class _Stream:
             "POST", COMPLETION_PATH, json=body, headers=headers
         ) as resp:
             resp.raise_for_status()
+            if "application/json" in resp.headers.get("content-type", "").lower():
+                resp.read()
+                try:
+                    data = resp.json()
+                except ValueError:
+                    raise RuntimeError("DeepSeek returned invalid JSON instead of SSE") from None
+                _raise_if_muted(data)
+                raise RuntimeError(_completion_json_error(data))
             yield from _parse_sse(resp.iter_lines(), meta)
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
@@ -309,16 +382,34 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[str, str]]:
     we look in a few plausible spots defensively.
     """
     frag_types: list = []
+    frag_texts: list[str] = []
     active_path: Optional[str] = None
 
-    def add_fragments(frags) -> Iterator[tuple[str, str]]:
-        for frag in frags or []:
+    def add_fragments(frags, snapshot=False) -> Iterator[tuple[str, str]]:
+        for index, frag in enumerate(frags or []):
             if not isinstance(frag, dict):
                 continue
             kind = frag.get("type") or RESPONSE
+            content = frag.get("content")
+            content = content if isinstance(content, str) else ""
+            if snapshot and index < len(frag_types):
+                # A later full snapshot can repeat text already emitted as deltas.
+                previous = frag_texts[index]
+                if frag_types[index] != kind:
+                    raise RuntimeError("DeepSeek changed an existing fragment type")
+                if previous.startswith(content):
+                    continue
+                if not content.startswith(previous):
+                    raise RuntimeError("DeepSeek replaced already streamed text")
+                delta = content[len(previous):]
+                frag_texts[index] = content
+                if delta:
+                    yield kind, delta
+                continue
             frag_types.append(kind)
-            if isinstance(frag.get("content"), str) and frag["content"]:
-                yield kind, frag["content"]
+            frag_texts.append(content)
+            if content:
+                yield kind, content
 
     def type_at(path: str) -> str:
         # "response/fragments/<index>/content" -> that fragment's type. Before
@@ -336,6 +427,12 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[str, str]]:
         elif path.endswith("fragments") and isinstance(v, list):
             yield from add_fragments(v)
         elif path.endswith("/content") and isinstance(v, str) and op in (None, "APPEND"):
+            try:
+                index = int(path.split("/")[-2])
+                frag_texts[index] += v
+            except (IndexError, ValueError):
+                if frag_texts:
+                    frag_texts[-1] += v
             yield type_at(path), v
         elif path.endswith("message_id") and isinstance(v, int) and meta is not None:
             meta["message_id"] = v
@@ -351,13 +448,18 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[str, str]]:
         except json.JSONDecodeError:
             continue
 
+        if not isinstance(obj, dict):
+            continue
+        _raise_if_muted(obj)
+        if obj.get("error") or (isinstance(obj.get("code"), int) and obj["code"] != 0):
+            raise RuntimeError("DeepSeek reported an error inside its completion stream")
         v = obj.get("v")
 
         # Snapshot frame: full response object.
         if isinstance(v, dict) and "response" in v:
             if meta is not None:
                 _capture_message_id(meta, v)
-            yield from add_fragments(v["response"].get("fragments"))
+            yield from add_fragments(v["response"].get("fragments"), snapshot=True)
             active_path = "response/fragments/-1/content"
             continue
 

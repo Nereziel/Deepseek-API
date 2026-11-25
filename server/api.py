@@ -21,18 +21,24 @@ RATE_LIMIT_PER_MINUTE); /healthz is exempt.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
+from pathlib import Path
+
+import anyio
+import httpx
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from deepseek.auth import LoginRequired
-from deepseek.client import DeepSeekClient
+from deepseek.client import AccountMuted, DeepSeekClient
 
 from .config import (
     MODEL_MAP,
+    MAX_PROMPT_CHARS,
     RATE_LIMIT_PER_MINUTE,
     SERVER_INTERACTIVE_LOGIN,
     TRUST_PROXY_HEADERS,
@@ -45,8 +51,13 @@ from .openai_format import (
     stream_chunks,
     stream_error,
 )
+from .stream_tools import buffered_tool_stream
+from .tools import active_tools, parse_tool_calls, prepare_tool_messages
 from .ratelimit import RateLimiter, install_rate_limit
 from .schemas import ChatCompletionRequest
+from .safety_gate import SafetyGate, SingleCompletionMiddleware
+
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="DeepSeek OpenAI-compatible API", version="0.1.0")
 install_rate_limit(
@@ -54,6 +65,26 @@ install_rate_limit(
     RateLimiter(limit=RATE_LIMIT_PER_MINUTE, window=60.0),
     trust_forwarded=TRUST_PROXY_HEADERS,
 )
+
+_gate = SafetyGate(Path(__file__).resolve().parents[1] / "session" / "account_muted.json",
+                   MAX_PROMPT_CHARS)
+app.add_middleware(SingleCompletionMiddleware, gate_provider=lambda: _gate)
+
+
+class ClosingStreamingResponse(StreamingResponse):
+    """Close a primed upstream iterator even if the caller disconnects."""
+
+    def __init__(self, content, *, frames, **kwargs):
+        super().__init__(content, **kwargs)
+        self.frames = frames
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await run_in_threadpool(self.frames.close)
+
 
 # One shared client (and its signed-in session) built lazily on first use.
 _client: DeepSeekClient | None = None
@@ -87,9 +118,35 @@ def _error(message: str, status: int = 500, err_type: str = "server_error"):
     )
 
 
+def _muted_details(exc: AccountMuted) -> dict:
+    _gate.latch_muted(exc)
+    logger.warning("DeepSeek account muted: mute_until=%r", exc.mute_until)
+    return {"message": str(exc), "type": "permission_error",
+            "code": "account_muted", "mute_until": exc.mute_until,
+            "retryable": False}
+
+
+def _muted_error(exc: AccountMuted):
+    return JSONResponse(status_code=403, content={"error": _muted_details(exc)})
+
+
+def _http_error(exc: httpx.HTTPStatusError):
+    if exc.response.status_code == 429:
+        delay = _gate.cooldown(exc.response.headers.get("Retry-After"))
+        logger.warning("DeepSeek rate limited; paused for %s seconds", delay)
+        return JSONResponse(status_code=429, headers={"Retry-After": str(delay)},
+                            content={"error": {"message": "DeepSeek rate limited the request.",
+                            "type": "rate_limit_error", "code": "upstream_rate_limited"}})
+    if exc.response.status_code == 403:
+        return _error("DeepSeek rejected access; check the account.", status=403,
+                      err_type="permission_error")
+    return _error(f"DeepSeek HTTP {exc.response.status_code}", status=502,
+                  err_type="upstream_error")
+
+
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    return _gate.snapshot()
 
 
 @app.get("/v1/models")
@@ -119,16 +176,71 @@ async def chat_completions(req: ChatCompletionRequest):
     # A thread's model is fixed when it's created, so on resume we ignore `model`
     # (the OpenAI SDK always sends one) and let the existing thread's model stand.
     model_type = None if req.conversation_id else resolve_model_type(req.model)
-    prompt = messages_to_prompt(req.messages)
+    try:
+        enabled_tools = active_tools(req.tools, req.tool_choice)
+    except ValueError as e:
+        return _error(str(e), status=400, err_type="invalid_request_error")
+    prepared_messages = prepare_tool_messages(req.messages, enabled_tools, req.tool_choice)
+    prompt = messages_to_prompt(prepared_messages)
+    rejected = _gate.check_prompt(len(prompt))
+    if rejected is not None:
+        return rejected
+    logger.info("DeepSeek request: model=%s stream=%s thinking=%s messages=%d tools=%d prompt_chars=%d",
+                req.model, req.stream, req.thinking_enabled, len(req.messages),
+                len(enabled_tools), len(prompt))
 
     try:
         # Off the event loop: get_client() uses Playwright's sync API, which
         # errors if run inside the asyncio loop.
         client = await run_in_threadpool(get_client)
+    except AccountMuted as e:
+        return _muted_error(e)
     except LoginRequired as e:
         return _error(str(e), status=503, err_type="login_required")
+    except httpx.HTTPStatusError as e:
+        return _http_error(e)
     except Exception as e:  # session/login failure
         return _error(f"Failed to initialise DeepSeek session: {e}")
+
+    if enabled_tools:
+        # The web API cannot natively stream tools. Buffer the upstream response
+        # before classifying it so that we never expose partial tool syntax.
+        try:
+            reply = await run_in_threadpool(
+                client.chat, prompt, req.conversation_id,
+                model_type, req.thinking_enabled, req.search,
+            )
+        except AccountMuted as e:
+            return _muted_error(e)
+        except LoginRequired as e:
+            return _error(str(e), status=503, err_type="login_required")
+        except httpx.HTTPStatusError as e:
+            return _http_error(e)
+        except Exception as e:
+            return _error(f"DeepSeek request failed: {e}")
+
+        if not reply.text.strip():
+            logger.warning("DeepSeek empty completion: reasoning_chars=%d", len(reply.reasoning))
+            return _error("DeepSeek returned no final content", status=502, err_type="upstream_error")
+        completion = completion_response(
+            req.model, reply.text, prompt, reply.conversation_id, reply.reasoning
+        )
+        calls = parse_tool_calls(reply.text, enabled_tools, req.parallel_tool_calls)
+        if calls:
+            completion["choices"][0]["message"] = {
+                "role": "assistant", "content": None, "tool_calls": calls
+            }
+            if reply.reasoning:
+                completion["choices"][0]["message"]["reasoning_content"] = reply.reasoning
+            completion["choices"][0]["finish_reason"] = "tool_calls"
+        logger.info("DeepSeek completion: text_chars=%d reasoning_chars=%d tool_calls=%d",
+                    len(reply.text), len(reply.reasoning), len(calls))
+        if req.stream:
+            return StreamingResponse(
+                buffered_tool_stream(completion), media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+            )
+        return completion
 
     if req.stream:
         # Open the thread before responding, so failures here (bad session,
@@ -136,33 +248,70 @@ async def chat_completions(req: ChatCompletionRequest):
         try:
             stream = await run_in_threadpool(
                 client.stream, prompt, req.conversation_id,
-                model_type, req.thinking, req.search,
+                model_type, req.thinking_enabled, req.search,
             )
+        except AccountMuted as e:
+            return _muted_error(e)
         except LoginRequired as e:
             return _error(str(e), status=503, err_type="login_required")
+        except httpx.HTTPStatusError as e:
+            return _http_error(e)
         except Exception as e:
             return _error(f"DeepSeek request failed: {e}")
 
-        def gen():
-            # Headers are already sent by now, so report a mid-stream failure
-            # as an error frame (the OpenAI SDK raises on it) rather than
-            # silently dropping the connection.
-            try:
-                yield from stream_chunks(req.model, stream)
-            except Exception as e:
-                yield from stream_error(f"DeepSeek request failed: {e}")
+        # Prime the stream before sending headers: a JSON restriction from
+        # upstream must be an HTTP 403, not a successful HTTP 200 SSE.
+        frames = iter(stream_chunks(req.model, stream))
+        try:
+            first = await run_in_threadpool(next, frames, None)
+        except AccountMuted as e:
+            return _muted_error(e)
+        except LoginRequired as e:
+            return _error(str(e), status=503, err_type="login_required")
+        except httpx.HTTPStatusError as e:
+            return _http_error(e)
+        except Exception as e:
+            logger.warning("DeepSeek stream failed before first frame: %s", type(e).__name__)
+            return _error(f"DeepSeek request failed: {e}", status=502, err_type="upstream_error")
+        if first is None:
+            return _error("DeepSeek returned no stream", status=502, err_type="upstream_error")
 
-        return StreamingResponse(gen(), media_type="text/event-stream")
+        def gen():
+            try:
+                yield first
+                yield from frames
+            except AccountMuted as e:
+                yield from stream_error(str(e), err_type="permission_error",
+                                        details=_muted_details(e))
+            except httpx.HTTPStatusError as e:
+                response = _http_error(e)
+                import json
+                details = json.loads(response.body)["error"]
+                yield from stream_error(details["message"], details=details)
+            except Exception as e:
+                logger.warning("DeepSeek stream failed: %s", type(e).__name__)
+                yield from stream_error(f"DeepSeek request failed: {e}", err_type="upstream_error")
+
+        return ClosingStreamingResponse(gen(), frames=frames, media_type="text/event-stream")
 
     try:
         reply = await run_in_threadpool(
             client.chat, prompt, req.conversation_id,
-            model_type, req.thinking, req.search,
+            model_type, req.thinking_enabled, req.search,
         )
+    except AccountMuted as e:
+        return _muted_error(e)
     except LoginRequired as e:
         return _error(str(e), status=503, err_type="login_required")
+    except httpx.HTTPStatusError as e:
+        return _http_error(e)
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
 
+    if not reply.text.strip():
+        logger.warning("DeepSeek empty completion: reasoning_chars=%d", len(reply.reasoning))
+        return _error("DeepSeek returned no final content", status=502, err_type="upstream_error")
+    logger.info("DeepSeek completion: text_chars=%d reasoning_chars=%d tool_calls=0",
+                len(reply.text), len(reply.reasoning))
     return completion_response(req.model, reply.text, prompt, reply.conversation_id,
                                reply.reasoning)

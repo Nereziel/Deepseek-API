@@ -27,11 +27,18 @@ from typing import Dict, Optional
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
+from .proxy import proxy_url
+
 ROOT = Path(__file__).resolve().parent.parent
 # Load .env before reading settings below, whichever entry point imported us.
 load_dotenv(ROOT / ".env")
-# Override with DEEPSEEK_PROFILE_DIR to reuse an existing signed-in Chrome profile.
-DEFAULT_PROFILE_DIR = Path(os.getenv("DEEPSEEK_PROFILE_DIR", ROOT / "session" / "profile"))
+# Explicit browser selection; auto preserves the original Chrome-first behavior.
+PLAYWRIGHT_CHANNEL = os.getenv("PLAYWRIGHT_CHANNEL", "auto").strip().lower()
+if PLAYWRIGHT_CHANNEL not in {"auto", "chrome", "msedge", "chromium"}:
+    raise ValueError("PLAYWRIGHT_CHANNEL must be auto, chrome, msedge or chromium")
+# Edge gets its own project-local profile, avoiding reuse of a Chrome profile.
+_profile_name = "profile-msedge" if PLAYWRIGHT_CHANNEL == "msedge" else "profile"
+DEFAULT_PROFILE_DIR = Path(os.getenv("DEEPSEEK_PROFILE_DIR", ROOT / "session" / _profile_name))
 DEFAULT_SESSION_FILE = ROOT / "session" / "session.json"
 
 CHAT_URL = "https://chat.deepseek.com/"
@@ -153,6 +160,30 @@ def _safe_goto(page, url: str) -> None:
     page.wait_for_timeout(2000)
 
 
+def _launch_browser(playwright, profile_dir: Path, headless: bool):
+    """Use the configured browser for login and refresh.
+
+    Explicit channels never silently fall back to a different executable.
+    Only auto retains the original Chrome -> bundled Chromium fallback.
+    """
+    kwargs = {"headless": headless, "args": LAUNCH_ARGS}
+    proxy = proxy_url()
+    if proxy:
+        kwargs["proxy"] = {"server": proxy}
+    if PLAYWRIGHT_CHANNEL == "chromium":
+        return playwright.chromium.launch_persistent_context(str(profile_dir), **kwargs)
+    if PLAYWRIGHT_CHANNEL != "auto":
+        return playwright.chromium.launch_persistent_context(
+            str(profile_dir), channel=PLAYWRIGHT_CHANNEL, **kwargs
+        )
+    try:
+        return playwright.chromium.launch_persistent_context(
+            str(profile_dir), channel="chrome", **kwargs
+        )
+    except Exception:
+        return playwright.chromium.launch_persistent_context(str(profile_dir), **kwargs)
+
+
 def login(
     profile_dir: Path = DEFAULT_PROFILE_DIR,
     headless: bool = False,
@@ -169,14 +200,7 @@ def login(
     pass this so the window doesn't visibly bounce CHAT_URL -> SIGNIN_URL."""
     profile_dir.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
-        try:
-            context = p.chromium.launch_persistent_context(
-                str(profile_dir), headless=headless, channel="chrome", args=LAUNCH_ARGS,
-            )
-        except Exception:
-            context = p.chromium.launch_persistent_context(
-                str(profile_dir), headless=headless, args=LAUNCH_ARGS,
-            )
+        context = _launch_browser(p, profile_dir, headless=headless)
         page = context.pages[0] if context.pages else context.new_page()
 
         # Normally we first land on CHAT_URL to reuse an already-signed-in
@@ -209,14 +233,7 @@ def _headless_refresh(profile_dir: Path) -> Optional[Session]:
     visible window."""
     profile_dir.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
-        try:
-            context = p.chromium.launch_persistent_context(
-                str(profile_dir), headless=True, channel="chrome", args=LAUNCH_ARGS,
-            )
-        except Exception:
-            context = p.chromium.launch_persistent_context(
-                str(profile_dir), headless=True, args=LAUNCH_ARGS,
-            )
+        context = _launch_browser(p, profile_dir, headless=True)
         page = context.pages[0] if context.pages else context.new_page()
         try:
             _safe_goto(page, CHAT_URL)

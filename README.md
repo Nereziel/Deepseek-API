@@ -13,6 +13,14 @@ You sign in once in a browser with your DeepSeek account; your session is saved 
 
 ---
 
+## OpenCode integration
+
+This fork supports experimental prompt-emulated function calling directly in
+`/v1/chat/completions` (no separate middleware). For **Windows Server setup,
+OpenCode 2.x configuration and limitations**, see [docs/opencode.md](docs/opencode.md).
+
+---
+
 ## Table of contents
 
 - [Why use this?](#why-use-this)
