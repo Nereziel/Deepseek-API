@@ -223,6 +223,8 @@ class DeepSeekClient:
         survives token expiry without a restart."""
         token = self.session.token
         r = self._http.post(path, json=body)
+        if r.status_code in (403, 429):
+            r.raise_for_status()
         if _auth_failed(r):
             self.refresh_session(stale_token=token)
             r = self._http.post(path, json=body)

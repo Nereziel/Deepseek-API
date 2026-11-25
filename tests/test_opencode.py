@@ -8,6 +8,13 @@ from server.tools import active_tools, parse_tool_calls, prepare_tool_messages
 from server.stream_tools import buffered_tool_stream
 
 
+@pytest.fixture(autouse=True)
+def isolated_safety_gate(monkeypatch, tmp_path):
+    from server import api
+    from server.safety_gate import SafetyGate
+    monkeypatch.setattr(api, "_gate", SafetyGate(tmp_path / "account_muted.json"))
+
+
 def tool():
     return ToolDefinition.model_validate({"type": "function", "function": {
         "name": "read_file", "description": "Read a file",

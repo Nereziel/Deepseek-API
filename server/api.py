@@ -24,6 +24,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from pathlib import Path
+
+import anyio
+import httpx
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -34,6 +38,7 @@ from deepseek.client import AccountMuted, DeepSeekClient
 
 from .config import (
     MODEL_MAP,
+    MAX_PROMPT_CHARS,
     RATE_LIMIT_PER_MINUTE,
     SERVER_INTERACTIVE_LOGIN,
     TRUST_PROXY_HEADERS,
@@ -50,6 +55,7 @@ from .stream_tools import buffered_tool_stream
 from .tools import active_tools, parse_tool_calls, prepare_tool_messages
 from .ratelimit import RateLimiter, install_rate_limit
 from .schemas import ChatCompletionRequest
+from .safety_gate import SafetyGate, SingleCompletionMiddleware
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -59,6 +65,26 @@ install_rate_limit(
     RateLimiter(limit=RATE_LIMIT_PER_MINUTE, window=60.0),
     trust_forwarded=TRUST_PROXY_HEADERS,
 )
+
+_gate = SafetyGate(Path(__file__).resolve().parents[1] / "session" / "account_muted.json",
+                   MAX_PROMPT_CHARS)
+app.add_middleware(SingleCompletionMiddleware, gate_provider=lambda: _gate)
+
+
+class ClosingStreamingResponse(StreamingResponse):
+    """Close a primed upstream iterator even if the caller disconnects."""
+
+    def __init__(self, content, *, frames, **kwargs):
+        super().__init__(content, **kwargs)
+        self.frames = frames
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await run_in_threadpool(self.frames.close)
+
 
 # One shared client (and its signed-in session) built lazily on first use.
 _client: DeepSeekClient | None = None
@@ -93,6 +119,7 @@ def _error(message: str, status: int = 500, err_type: str = "server_error"):
 
 
 def _muted_details(exc: AccountMuted) -> dict:
+    _gate.latch_muted(exc)
     logger.warning("DeepSeek account muted: mute_until=%r", exc.mute_until)
     return {"message": str(exc), "type": "permission_error",
             "code": "account_muted", "mute_until": exc.mute_until,
@@ -103,9 +130,23 @@ def _muted_error(exc: AccountMuted):
     return JSONResponse(status_code=403, content={"error": _muted_details(exc)})
 
 
+def _http_error(exc: httpx.HTTPStatusError):
+    if exc.response.status_code == 429:
+        delay = _gate.cooldown(exc.response.headers.get("Retry-After"))
+        logger.warning("DeepSeek rate limited; paused for %s seconds", delay)
+        return JSONResponse(status_code=429, headers={"Retry-After": str(delay)},
+                            content={"error": {"message": "DeepSeek rate limited the request.",
+                            "type": "rate_limit_error", "code": "upstream_rate_limited"}})
+    if exc.response.status_code == 403:
+        return _error("DeepSeek rejected access; check the account.", status=403,
+                      err_type="permission_error")
+    return _error(f"DeepSeek HTTP {exc.response.status_code}", status=502,
+                  err_type="upstream_error")
+
+
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    return _gate.snapshot()
 
 
 @app.get("/v1/models")
@@ -141,6 +182,9 @@ async def chat_completions(req: ChatCompletionRequest):
         return _error(str(e), status=400, err_type="invalid_request_error")
     prepared_messages = prepare_tool_messages(req.messages, enabled_tools, req.tool_choice)
     prompt = messages_to_prompt(prepared_messages)
+    rejected = _gate.check_prompt(len(prompt))
+    if rejected is not None:
+        return rejected
     logger.info("DeepSeek request: model=%s stream=%s thinking=%s messages=%d tools=%d prompt_chars=%d",
                 req.model, req.stream, req.thinking_enabled, len(req.messages),
                 len(enabled_tools), len(prompt))
@@ -153,6 +197,8 @@ async def chat_completions(req: ChatCompletionRequest):
         return _muted_error(e)
     except LoginRequired as e:
         return _error(str(e), status=503, err_type="login_required")
+    except httpx.HTTPStatusError as e:
+        return _http_error(e)
     except Exception as e:  # session/login failure
         return _error(f"Failed to initialise DeepSeek session: {e}")
 
@@ -168,6 +214,8 @@ async def chat_completions(req: ChatCompletionRequest):
             return _muted_error(e)
         except LoginRequired as e:
             return _error(str(e), status=503, err_type="login_required")
+        except httpx.HTTPStatusError as e:
+            return _http_error(e)
         except Exception as e:
             return _error(f"DeepSeek request failed: {e}")
 
@@ -206,6 +254,8 @@ async def chat_completions(req: ChatCompletionRequest):
             return _muted_error(e)
         except LoginRequired as e:
             return _error(str(e), status=503, err_type="login_required")
+        except httpx.HTTPStatusError as e:
+            return _http_error(e)
         except Exception as e:
             return _error(f"DeepSeek request failed: {e}")
 
@@ -218,6 +268,8 @@ async def chat_completions(req: ChatCompletionRequest):
             return _muted_error(e)
         except LoginRequired as e:
             return _error(str(e), status=503, err_type="login_required")
+        except httpx.HTTPStatusError as e:
+            return _http_error(e)
         except Exception as e:
             logger.warning("DeepSeek stream failed before first frame: %s", type(e).__name__)
             return _error(f"DeepSeek request failed: {e}", status=502, err_type="upstream_error")
@@ -231,13 +283,16 @@ async def chat_completions(req: ChatCompletionRequest):
             except AccountMuted as e:
                 yield from stream_error(str(e), err_type="permission_error",
                                         details=_muted_details(e))
+            except httpx.HTTPStatusError as e:
+                response = _http_error(e)
+                import json
+                details = json.loads(response.body)["error"]
+                yield from stream_error(details["message"], details=details)
             except Exception as e:
                 logger.warning("DeepSeek stream failed: %s", type(e).__name__)
                 yield from stream_error(f"DeepSeek request failed: {e}", err_type="upstream_error")
-            finally:
-                frames.close()
 
-        return StreamingResponse(gen(), media_type="text/event-stream")
+        return ClosingStreamingResponse(gen(), frames=frames, media_type="text/event-stream")
 
     try:
         reply = await run_in_threadpool(
@@ -248,6 +303,8 @@ async def chat_completions(req: ChatCompletionRequest):
         return _muted_error(e)
     except LoginRequired as e:
         return _error(str(e), status=503, err_type="login_required")
+    except httpx.HTTPStatusError as e:
+        return _http_error(e)
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
 

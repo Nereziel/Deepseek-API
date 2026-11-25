@@ -127,3 +127,36 @@ the original behavior. Restart the server after changing the settings.
 Keep the proxy bound to loopback. When OpenCode runs on the same machine, its
 provider base URL is `http://127.0.0.1:8001/v1`; incoming API requests do not
 use the SOCKS5 proxy. Test the proxy separately before signing in manually.
+
+
+## Local test safety guard
+
+The bridge admits only one completion at a time, including the complete SSE
+response. Concurrent completions receive HTTP 429 instead of being queued.
+The existing per-IP rate limiter also applies. Run one server process only;
+the concurrency guard and cooldown are process-local.
+
+`MAX_PROMPT_CHARS=80000` limits the fully flattened prompt including tool
+definitions. This is a conservative local test budget, not a measured DeepSeek
+context limit. Oversized requests return HTTP 400 with `prompt_too_large`;
+nothing is truncated or sent upstream. Reduce context and tools in the caller.
+
+An explicit `account_muted` response latches a stop in
+`session/account_muted.json`, including across restarts. The API returns
+403 locally, without contacting DeepSeek. Check the restriction in the
+official web UI; only after the provider confirms access is restored and the
+intended use is permitted, stop the bridge and remove the local state file.
+Never use this to bypass an active restriction. The guard does not
+automatically resume on a timestamp or rotate accounts. A corrupt state file
+fails closed. If state persistence fails, the in-memory block still applies;
+check logs before restarting.
+
+Upstream HTTP 429 pauses new completions for the Retry-After duration
+(seconds or HTTP date; 60 seconds if absent/invalid). There are no automatic
+completion retries. Authentication refresh for an expired token remains
+unchanged. Cooldown is process-local. /healthz reports restriction state,
+cooldown, current concurrency and aggregate counters; it is local only and
+does not verify access to DeepSeek. It remains HTTP 200 for process liveness.
+
+These protections reduce accidental load; they do not make unofficial
+access permitted or guarantee that accounts will not be restricted.
